@@ -1,0 +1,61 @@
+name: TeamApt Balance Alert
+
+on:
+  # No `schedule:` trigger here on purpose: GitHub Actions' cron has a 5-minute
+  # floor and imprecise delivery. Instead, an external scheduler (cron-job.org)
+  # calls the GitHub API to fire `workflow_dispatch` on whatever cadence it's
+  # configured with (default 3 minutes — see README). This is also the entry
+  # point for a manual "Run workflow" click in the Actions tab.
+  workflow_dispatch: {}
+
+concurrency:
+  # Serialize runs instead of letting a slow run overlap the next scheduled tick —
+  # avoids two instances racing on the npoint.io state bin or double-paging PagerDuty.
+  group: teamapt-balance-alert
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Playwright browser + OS dependencies
+        run: python -m playwright install --with-deps chromium
+
+      - name: Run the balance check
+        env:
+          TEAMAPT_URL: https://traft.teamapt.com
+          TEAMAPT_USERNAME: ${{ secrets.TEAMAPT_USERNAME }}
+          TEAMAPT_PASSWORD: ${{ secrets.TEAMAPT_PASSWORD }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          PAGERDUTY_ROUTING_KEY: ${{ secrets.PAGERDUTY_ROUTING_KEY }}
+          BALANCE_THRESHOLD: ${{ secrets.BALANCE_THRESHOLD }}
+          STATE_URL: ${{ secrets.STATE_URL }}
+          AUTO_RESOLVE_SECONDS: "60"
+          OK_NOTIFY_INTERVAL_SECONDS: "900"
+          WARNING_NOTIFY_INTERVAL_SECONDS: "300"
+          HEADFUL: "0"
+        run: python balance_alert.py
+
+      - name: Slack heads-up if the run itself failed
+        if: failure()
+        env:
+          WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          [ -n "${WEBHOOK}" ] || { echo "no slack webhook; skipping"; exit 0; }
+          python3 -c 'import json,os,urllib.request; w=os.environ["WEBHOOK"]; msg=":warning: *TeamApt balance check did not complete* (GitHub Actions run failed).\n:point_right: Please check the pre-funded virtual balance MANUALLY until the monitor is back online: https://traft.teamapt.com/reports/transfers"; urllib.request.urlopen(urllib.request.Request(w, data=json.dumps({"text": msg}).encode(), headers={"Content-Type": "application/json"}), timeout=20)'
